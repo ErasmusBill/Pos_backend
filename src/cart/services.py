@@ -1,12 +1,12 @@
 import uuid
 from datetime import datetime
 from fastapi import HTTPException, status
+from fastapi_cache import FastAPICache
 from sqlmodel import Session, select
 
 from .models import Order, OrderItem
 from .schemas import CheckoutRequest
-from src.sales.selectors import get_sales_product_by_id  # Or select directly
-from src.inventory.models import Product, StockLog  # To read cost_price and adjust stock
+from src.inventory.models import Product, StockLog  # Tracks cost metrics and updates inventory logs
 from src.sales.models import SalesProduct
 
 
@@ -15,7 +15,6 @@ class OrderService:
         self.namespace = "sales"
 
     async def _invalidate_cache(self):
-        from fastapi_cache import FastAPICache
         await FastAPICache.clear(namespace=self.namespace)
 
     def _generate_invoice_number(self, session: Session) -> str:
@@ -25,7 +24,6 @@ class OrderService:
         """
         current_year = datetime.utcnow().year
 
-        # Count existing orders for the current year to determine the next sequence number
         statement = select(Order).where(Order.invoice_number.like(f"INV-{current_year}-%"))
         existing_orders_count = len(session.exec(statement).all())
 
@@ -35,7 +33,8 @@ class OrderService:
     async def process_checkout(self, payload: CheckoutRequest, cashier_id: uuid.UUID, session: Session) -> Order:
         """
         Executes a complete POS checkout transaction block safely.
-        Validates stock levels, matches pricing metadata, snapshots values, and updates inventory.
+        Validates stock levels, matches pricing metadata, snapshots values,
+        and updates physical inventory while preserving audit trails.
         """
         try:
             invoice_num = self._generate_invoice_number(session=session)
@@ -53,9 +52,8 @@ class OrderService:
             running_total_tax = 0.0
             order_items_to_create = []
 
-            # 2. Process Cart Line Items
+            # 2. EVALUATE SCAN CARD / CART SELECTION MATRICES
             for cart_item in payload.items:
-                # Fetch Physical Inventory Product details (for stock tracking and cost price)
                 product = session.get(Product, cart_item.product_id)
                 if not product:
                     raise HTTPException(
@@ -63,7 +61,6 @@ class OrderService:
                         detail=f"Physical product with ID {cart_item.product_id} not found."
                     )
 
-                # Fetch Active Sales Product Parameters (for retail selling prices and tax brackets)
                 sales_product_statement = select(SalesProduct).where(
                     SalesProduct.product_id == cart_item.product_id,
                     SalesProduct.is_active == True
@@ -72,28 +69,35 @@ class OrderService:
                 if not sales_product:
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Product '{product.name}' is not configured for retail storefront sales."
+                        detail=f"Product '{product.name}' is not configured for active retail storefront sales."
                     )
 
-                # 3. Inventory Stock Validation Guard
                 if product.quantity_in_stock < cart_item.quantity:
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=f"Insufficient stock for '{product.name}'. Requested: {cart_item.quantity}, Available: {product.quantity_in_stock}."
                     )
 
-                # 4. Physical Stock Allocation & Degradation
-                product.quantity_in_stock -= cart_item.quantity
+
+                old_stock_snapshot = product.quantity_in_stock
+                new_stock_snapshot = old_stock_snapshot - cart_item.quantity
+
+
+                product.quantity_in_stock = new_stock_snapshot
                 session.add(product)
 
-                # Optional: If you have a StockLog architecture for internal inventory audits, append it here
-                # from src.inventory.models import StockLog
-                log = StockLog(product_id=product.id, change_amount=-cart_item.quantity, reason="SALE", reference_id=invoice_num)
+
+                log = StockLog(
+                    product_id=product.id,
+                    quantity_changed=-cart_item.quantity,
+                    previous_quantity=old_stock_snapshot,
+                    new_quantity=new_stock_snapshot,
+                    reason=f"SALE (Invoice: {invoice_num})"
+                )
                 session.add(log)
 
-                # 5. Financial Mathematics Calculations
                 unit_price = sales_product.selling_price
-                cost_price = product.cost_price  # Retained for static historical margin analysis
+                cost_price = product.cost_price
                 tax_rate = sales_product.tax_rate if sales_product.is_taxable else 0.0
 
                 line_subtotal = unit_price * cart_item.quantity
@@ -103,7 +107,6 @@ class OrderService:
                 running_sub_total += line_subtotal
                 running_total_tax += line_tax
 
-                # 6. Instantiate Immutable Historical Snapshot Record Row
                 db_item = OrderItem(
                     product_id=cart_item.product_id,
                     quantity=cart_item.quantity,
@@ -111,24 +114,20 @@ class OrderService:
                     cost_price=cost_price,
                     tax_rate=tax_rate,
                     line_total=line_grand_total,
-                    order=db_order  # Direct model link
+                    order=db_order
                 )
                 order_items_to_create.append(db_item)
 
-            # 7. Bind Derived Financial Aggregations back onto Header
             db_order.sub_total = round(running_sub_total, 2)
             db_order.total_tax = round(running_total_tax, 2)
             db_order.grand_total = round(running_sub_total + running_total_tax, 2)
 
-            # Stage line items to session context
             for item in order_items_to_create:
                 session.add(item)
 
-            # 8. Commit Atomic Unit of Work Block
             session.commit()
             session.refresh(db_order)
 
-            # Flush read-side Redis cache layers
             await self._invalidate_cache()
 
             return db_order

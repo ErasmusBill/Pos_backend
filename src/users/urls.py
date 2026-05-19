@@ -1,8 +1,7 @@
 import uuid
 from datetime import timedelta
-from http.client import HTTPException
 from typing import List, Optional
-from fastapi import Depends, APIRouter, status, BackgroundTasks
+from fastapi import Depends, APIRouter, status, BackgroundTasks, HTTPException
 from sqlmodel import Session
 from fastapi_cache.decorator import cache
 
@@ -95,7 +94,11 @@ async def change_password(data: ChangePasswordRequest, current_user: User = Depe
 @user_router.delete("/deactivate-me", tags=["Public - Users"])
 async def deactivate_self(current_user: User = Depends(get_current_user), session: Session = Depends(get_session)):
     """Allows a user to deactivate their own account."""
-    user = await user_service.soft_delete_user(user_id=current_user.id, session=session)
+    user = await user_service.soft_delete_user(
+        user_id=current_user.id,
+        current_user=current_user,
+        session=session
+    )
     return CustomResponse(message="Your account has been deactivated", data={"id": user.id, "is_active": user.is_active})
 
 
@@ -103,7 +106,10 @@ async def deactivate_self(current_user: User = Depends(get_current_user), sessio
 @user_router.patch("/update-user-role/{user_id}", response_model=UserResponse, tags=["User -Admin"])
 async def update_user_role(user_id: uuid.UUID, role_data: UserRoleUpdate, current_admin: User = Depends(get_current_user), session: Session = Depends(get_session)):
     if current_admin.role != UserRole.ADMIN:
-        raise HTTPException("You are not authorized to perform this action")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You are not authorized to perform this action"
+        )
     try:
         updated_user = await user_service.update_user_role(
             user_id=user_id,

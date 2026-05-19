@@ -8,6 +8,7 @@ Backend API for a Point-of-Sale (POS) system built with FastAPI, SQLModel, and A
 - Role-aware access controls (`admin`, `cashier`, `staff`)
 - Inventory management (categories, products, stock adjustment)
 - Sales product configuration (selling price, tax settings, active status)
+- POS checkout/order processing with invoice generation and stock logging
 - Email workflows (account activation and password reset)
 - Response caching via `fastapi-cache2` (currently in-memory backend)
 
@@ -30,7 +31,9 @@ Backend API for a Point-of-Sale (POS) system built with FastAPI, SQLModel, and A
 |   |-- db/
 |   |-- users/
 |   |-- inventory/
-|   `-- sales/
+|   |-- sales/
+|   |-- cart/
+|   `-- middlewares/
 |-- migrations/
 |-- static/uploads/products/
 |-- pyproject.toml
@@ -97,6 +100,41 @@ uv run uvicorn main:app --reload
   - `/categories`, `/products`, `/products/{product_id}/adjust-stock`
 - Sales (under `/api/v1/sales`):
   - `/products` and `/products/{sales_product_id}`
+- Orders/Checkout (under `/api/v1/orders`):
+  - `/checkout`, `/me/history`, `/analytics/dashboard`, `/analytics/predictive-stock`
+
+## Middleware
+
+The app registers these middlewares in `main.py`:
+
+- `RateLimitingMiddleware`:
+  - Applies to checkout endpoint (`/api/v1/orders/checkout`)
+  - Uses in-memory cache keys with a 12-second window
+  - Blocks duplicate bursts after 2 hits per client IP in the active window
+- `BusinessAuditLoggingMiddleware`:
+  - Logs request method/path/status/latency
+  - Adds `X-Process-Latency-Ms` response header
+- `GlobalExceptionMiddleware`:
+  - Catches unhandled exceptions
+  - Attempts DB rollback when request state holds a DB session
+  - Returns sanitized JSON `500` response
+- `TrustedHostMiddleware`:
+  - Allows `dashboard.yourposdomain.com`, `*.yourposdomain.com`, `localhost`, `127.0.0.1`, and `testserver` (for local test client requests)
+- `CORSMiddleware`:
+  - Allows origin `https://dashboard.yourposdomain.com` and local frontend `http://localhost:5173`
+
+## Cache and Invalidation
+
+- Cache backend: `InMemoryBackend` (`fastapi-cache2`) initialized in `main.py`.
+- Active cache namespaces:
+  - `users` (user list/profile related cached reads)
+  - `inventory` (category and product read endpoints)
+  - `sales` (checkout-adjacent read endpoints)
+- Write operations call namespace invalidation via `FastAPICache.clear(namespace=...)` in service layer:
+  - `UserService`
+  - `InventoryService`
+  - `SalesService`
+  - `OrderService`
 
 ## Notes
 

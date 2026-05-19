@@ -37,7 +37,7 @@ class SalesService:
             session.commit()
             session.refresh(new_sales_product)
 
-            self._invalidate_cache()
+            await self._invalidate_cache()
 
             return new_sales_product
 
@@ -65,7 +65,7 @@ class SalesService:
 
             session.commit()
             session.refresh(sales_product)
-            self._invalidate_cache()
+            await self._invalidate_cache()
             return sales_product
 
         except Exception as e:
@@ -87,7 +87,7 @@ class SalesService:
 
             session.commit()
             session.refresh(sales_product)
-            self._invalidate_cache()
+            await self._invalidate_cache()
 
             return sales_product
 
@@ -110,7 +110,7 @@ class SalesService:
 
             session.commit()
             session.refresh(sales_product)
-            self._invalidate_cache()
+            await self._invalidate_cache()
 
             return sales_product
 

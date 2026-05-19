@@ -126,7 +126,7 @@ async def soft_delete_sales_product(
         data=response_data
     )
 
-@sales_router.delete("/activate-sales-product/{sales_product_id}", status_code=status.HTTP_200_OK)
+@sales_router.post("/activate-sales-product/{sales_product_id}", status_code=status.HTTP_200_OK)
 async def activate_sales_product(
         sales_product_id: uuid.UUID,
         session: Session = Depends(get_session),
@@ -138,7 +138,7 @@ async def activate_sales_product(
             status_code=status.HTTP_403_FORBIDDEN
         )
 
-    deactivated_product = await sales_service.soft_delete_sales_product(
+    deactivated_product = await sales_service.activate_sales_product(
         sales_product_id=sales_product_id,
         admin_id=current_user.id,
         session=session

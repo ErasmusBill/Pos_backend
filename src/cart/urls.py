@@ -2,27 +2,26 @@ import uuid
 from datetime import datetime
 from typing import List, Optional
 from fastapi import APIRouter, Depends, status, HTTPException
+from fastapi_cache.decorator import cache
 from sqlmodel import Session
 
-#
 from src.common.responses import CustomResponse
 from src.db.engine import get_session
 from src.users.services import get_current_user
 from src.users.models import User, UserRole
 
-
 from .services import OrderService
-from .schemas import CheckoutRequest, OrderResponse
+from .schemas import CheckoutRequest, OrderResponse, DashboardAnalyticsResponse, InventoryForecastResponse
 from .selectors import (
     get_order_by_id,
     get_order_by_invoice_number,
     get_orders_by_date_range,
-    get_cashier_order_history
+    get_cashier_order_history,
+    get_eod_dashboard_metrics, get_low_stock_predictive_analysis
 )
 
 order_router = APIRouter(prefix="/orders", tags=["Order & Checkout Management"])
 order_service = OrderService()
-
 
 
 @order_router.post("/checkout", status_code=status.HTTP_201_CREATED)
@@ -35,21 +34,18 @@ async def checkout_cart(
     Process an active checkout cart collection from the register screen.
     Validates physical inventory, applies active retail tax configurations, and saves the receipt.
     """
-    # Safeguard: Block inactive accounts from creating transactions
     if not current_user.is_active:
-        return CustomResponse(
-            message="Your account is currently inactive. Contact your system admin.",
-            status_code=status.HTTP_403_FORBIDDEN
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your account is currently inactive. Contact your system admin."
         )
 
-    # Process transaction inside our atomic service method
     processed_order = await order_service.process_checkout(
         payload=payload,
         cashier_id=current_user.id,
         session=session
     )
 
-    # Serialize output structure matching standard Pydantic models
     response_data = OrderResponse.model_validate(processed_order).model_dump()
 
     return CustomResponse(
@@ -59,7 +55,63 @@ async def checkout_cart(
     )
 
 
-# --- 2. RETRIEVE SINGLE RECEIPT DETAILS (ID OR INVOICE NUMBER) ---
+@order_router.get("/me/history", status_code=status.HTTP_200_OK)
+@cache(namespace="sales", expire=3600)  # FIXED: Aligned namespace with services.py cache invalidation loop
+async def get_current_operator_history(
+        session: Session = Depends(get_session),
+        current_user: User = Depends(get_current_user)
+):
+    """
+    Allows active cashiers to verify their transaction totals for shift reconciliation.
+    """
+    my_orders = get_cashier_order_history(cashier_id=current_user.id, session=session)
+    response_data = [OrderResponse.model_validate(o).model_dump() for o in my_orders]
+
+    return CustomResponse(
+        message="Operator personal transaction history compiled successfully.",
+        status_code=status.HTTP_200_OK,
+        data=response_data
+    )
+
+
+@order_router.get("/analytics/dashboard", status_code=status.HTTP_200_OK)
+async def get_management_dashboard_metrics(
+        date: Optional[str] = None,
+        session: Session = Depends(get_session),
+        current_user: User = Depends(get_current_user)
+):
+    """
+    Exposes high-level gross margin, tax volume, cost profiling,
+    and transaction ledger distribution analysis for administrative review panels.
+    """
+    # Security Rule: Restrict heavy aggregated analytics fields strictly to Admin users
+    if current_user.role != UserRole.ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access Denied. Only system administrators can pull administrative dashboard analytics."
+        )
+
+    if date:
+        try:
+            target_date = datetime.strptime(date, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid date parameters format layout. Please provide a standard 'YYYY-MM-DD' query string."
+            )
+    else:
+        target_date = datetime.utcnow().date()
+
+    metrics = get_eod_dashboard_metrics(session=session, lookup_date=target_date)
+
+    return CustomResponse(
+        message=f"Financial analytics dashboard dataset for {target_date} compiled successfully.",
+        status_code=status.HTTP_200_OK,
+        data=metrics.model_dump()
+    )
+
+
+
 @order_router.get("/{order_id_or_invoice}", status_code=status.HTTP_200_OK)
 async def get_receipt_breakdown(
         order_id_or_invoice: str,
@@ -70,12 +122,12 @@ async def get_receipt_breakdown(
     Fetch comprehensive audit logs and lines for a specific receipt record.
     Accepts either standard system UUIDs or alphanumeric invoice strings (e.g., INV-2026-0001).
     """
-    # 1. Check if argument matches a system UUID format
+    order = None
+
     try:
         target_uuid = uuid.UUID(order_id_or_invoice)
         order = get_order_by_id(order_id=target_uuid, session=session)
     except ValueError:
-        # 2. Treat as an alphanumeric invoice string if UUID validation fails
         order = get_order_by_invoice_number(invoice_number=order_id_or_invoice, session=session)
 
     if not order:
@@ -104,14 +156,12 @@ async def get_sales_ledger_history(
     Extract transaction records for back-office performance analysis.
     Filters transactions by an optional ISO date string (YYYY-MM-DD). If no date is provided, defaults to today.
     """
-    # Security Rule: Restrict detailed financial ledger metrics to Management/Admin accounts
     if current_user.role != UserRole.ADMIN:
-        return CustomResponse(
-            message="Access Denied. Only system administrators can pull complete sales ledgers.",
-            status_code=status.HTTP_403_FORBIDDEN
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access Denied. Only system administrators can pull complete sales ledgers."
         )
 
-    # Normalize parsing query parameter string
     if date:
         try:
             target_date = datetime.strptime(date, "%Y-%m-%d")
@@ -124,8 +174,6 @@ async def get_sales_ledger_history(
         target_date = datetime.utcnow()
 
     orders_list = get_orders_by_date_range(session=session, start_date=target_date)
-
-    # Batch serialize complete array response collection
     response_data = [OrderResponse.model_validate(o).model_dump() for o in orders_list]
 
     return CustomResponse(
@@ -134,20 +182,40 @@ async def get_sales_ledger_history(
         data=response_data
     )
 
-
-@order_router.get("/me/history", status_code=status.HTTP_200_OK)
-async def get_current_operator_history(
+@order_router.get("/analytics/predictive-stock", status_code=status.HTTP_200_OK)
+async def get_inventory_runout_predictions(
+        window: int = 14,
         session: Session = Depends(get_session),
         current_user: User = Depends(get_current_user)
 ):
     """
-    Allows active cashiers to verify their transaction totals for shift reconciliation.
+    Evaluates rolling stock logging frequencies to forecast the remaining
+    lifespan depletion window for store items.
     """
-    my_orders = get_cashier_order_history(cashier_id=current_user.id, session=session)
-    response_data = [OrderResponse.model_validate(o).model_dump() for o in my_orders]
+    # Security Rule: Restrict predictive logistics to Admin/Managerial clearances
+    if current_user.role != UserRole.ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access Denied. Only inventory managers or admins can compute stock velocity forecasts."
+        )
+
+    # Restrict window metrics within realistic statistical bounds (7 to 90 days)
+    if window < 7 or window > 90:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Out of bounds window. Analysis range parameter must scale smoothly between 7 and 90 days."
+        )
+
+    predictions = get_low_stock_predictive_analysis(session=session, rolling_window_days=window)
+
+    response_payload = InventoryForecastResponse(
+        analysis_window_days=window,
+        generated_at=datetime.utcnow(),
+        forecasts=predictions
+    )
 
     return CustomResponse(
-        message="Operator personal transaction history compiled successfully.",
+        message="Predictive inventory velocity engine data computed successfully.",
         status_code=status.HTTP_200_OK,
-        data=response_data
+        data=response_payload.model_dump()
     )
