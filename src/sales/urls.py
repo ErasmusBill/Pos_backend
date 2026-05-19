@@ -27,7 +27,6 @@ async def create_sales_product(
             status_code=status.HTTP_403_FORBIDDEN
         )
 
-    # Extracted current_user.id and forwarded down to service layer
     new_sales_product = await sales_service.create_sales_product(
         data=payload,
         admin_id=current_user.id,
@@ -103,6 +102,32 @@ async def update_sales_product(
 
 @sales_router.delete("/products/{sales_product_id}", status_code=status.HTTP_200_OK)
 async def soft_delete_sales_product(
+        sales_product_id: uuid.UUID,
+        session: Session = Depends(get_session),
+        current_user: User = Depends(get_current_user)
+):
+    if current_user.role != UserRole.ADMIN:
+        return CustomResponse(
+            message="You ain't authorized to deactivate sales products.",
+            status_code=status.HTTP_403_FORBIDDEN
+        )
+
+    deactivated_product = await sales_service.soft_delete_sales_product(
+        sales_product_id=sales_product_id,
+        admin_id=current_user.id,
+        session=session
+    )
+
+    response_data = SalesProductResponse.model_validate(deactivated_product).model_dump()
+
+    return CustomResponse(
+        message="Product successfully removed from active customer-facing sale paths.",
+        status_code=status.HTTP_200_OK,
+        data=response_data
+    )
+
+@sales_router.delete("/activate-sales-product/{sales_product_id}", status_code=status.HTTP_200_OK)
+async def activate_sales_product(
         sales_product_id: uuid.UUID,
         session: Session = Depends(get_session),
         current_user: User = Depends(get_current_user)

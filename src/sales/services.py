@@ -94,3 +94,26 @@ class SalesService:
         except Exception as e:
             session.rollback()
             raise e
+
+    async def activate_sales_product(self, sales_product_id: uuid.UUID, admin_id: uuid.UUID, session: Session) -> SalesProduct:
+        sales_product = await get_sales_product_by_id(sales_product_id=sales_product_id, session=session)
+
+        if not sales_product:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Sales configuration with ID {sales_product_id} not found."
+            )
+
+        try:
+            sales_product.is_active = True
+            sales_product.updated_by_id = admin_id
+
+            session.commit()
+            session.refresh(sales_product)
+            self._invalidate_cache()
+
+            return sales_product
+
+        except Exception as e:
+            session.rollback()
+            raise e

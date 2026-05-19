@@ -8,6 +8,7 @@ from src.db.engine import create_db_and_tables
 from src.users.urls import user_router
 from src.inventory.urls import inventory_router
 from src.sales.urls import sales_router
+from src.cart.urls import order_router
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -40,6 +41,8 @@ app = FastAPI(
 app.include_router(user_router, prefix="/api/v1")
 app.include_router(inventory_router, prefix="/api/v1")
 app.include_router(sales_router, prefix="/api/v1")
+
+app.include_router(order_router, prefix="/api/v1")
 
 
 @app.get("/health", tags=["System"])
