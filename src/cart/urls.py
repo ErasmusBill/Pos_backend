@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 from typing import List, Optional
-from fastapi import APIRouter, Depends, status, HTTPException
+from fastapi import APIRouter, Depends, status, HTTPException, BackgroundTasks  # Added BackgroundTasks
 from fastapi_cache.decorator import cache
 from sqlmodel import Session
 
@@ -10,23 +10,28 @@ from src.db.engine import get_session
 from src.users.services import get_current_user
 from src.users.models import User, UserRole
 
+# Core Business & Notification Layer Imports
 from .services import OrderService
 from .schemas import CheckoutRequest, OrderResponse, DashboardAnalyticsResponse, InventoryForecastResponse
+from src.notification.services import POSNotificationService
 from .selectors import (
     get_order_by_id,
     get_order_by_invoice_number,
     get_orders_by_date_range,
     get_cashier_order_history,
-    get_eod_dashboard_metrics, get_low_stock_predictive_analysis
+    get_eod_dashboard_metrics,
+    get_low_stock_predictive_analysis
 )
 
 order_router = APIRouter(prefix="/orders", tags=["Order & Checkout Management"])
 order_service = OrderService()
+notification_service = POSNotificationService()  # <-- NEW: Instantiate the notification engine
 
 
 @order_router.post("/checkout", status_code=status.HTTP_201_CREATED)
 async def checkout_cart(
         payload: CheckoutRequest,
+        background_tasks: BackgroundTasks,  # <-- NEW: Inject BackgroundTasks system hook
         session: Session = Depends(get_session),
         current_user: User = Depends(get_current_user)
 ):
@@ -45,6 +50,16 @@ async def checkout_cart(
         cashier_id=current_user.id,
         session=session
     )
+
+
+    # If the payload includes a customer phone number, offload the digital receipt delivery
+    if getattr(payload, "customer_phone", None):
+        background_tasks.add_task(
+            notification_service.dispatch_customer_digital_receipt,
+            phone=payload.customer_phone,
+            invoice_number=processed_order.invoice_number,
+            total_amount=processed_order.grand_total
+        )
 
     response_data = OrderResponse.model_validate(processed_order).model_dump()
 
@@ -111,7 +126,6 @@ async def get_management_dashboard_metrics(
     )
 
 
-
 @order_router.get("/{order_id_or_invoice}", status_code=status.HTTP_200_OK)
 async def get_receipt_breakdown(
         order_id_or_invoice: str,
@@ -143,7 +157,6 @@ async def get_receipt_breakdown(
         status_code=status.HTTP_200_OK,
         data=response_data
     )
-
 
 
 @order_router.get("", status_code=status.HTTP_200_OK)
@@ -182,6 +195,7 @@ async def get_sales_ledger_history(
         data=response_data
     )
 
+
 @order_router.get("/analytics/predictive-stock", status_code=status.HTTP_200_OK)
 async def get_inventory_runout_predictions(
         window: int = 14,
@@ -192,14 +206,12 @@ async def get_inventory_runout_predictions(
     Evaluates rolling stock logging frequencies to forecast the remaining
     lifespan depletion window for store items.
     """
-    # Security Rule: Restrict predictive logistics to Admin/Managerial clearances
     if current_user.role != UserRole.ADMIN:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access Denied. Only inventory managers or admins can compute stock velocity forecasts."
         )
 
-    # Restrict window metrics within realistic statistical bounds (7 to 90 days)
     if window < 7 or window > 90:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
